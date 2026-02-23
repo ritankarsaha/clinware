@@ -72,12 +72,20 @@ npm run build
 cp .env.example .env
 ```
 
-Edit `.env` and set your Google API key:
+Edit `.env` and uncomment / set your Google API key:
 ```bash
 export GOOGLE_API_KEY=AIza...your-key-here...
 ```
 
 > **Never commit `.env` to git.** It is already listed in `.gitignore`.
+
+**Alternative: YAML config file**
+
+Instead of a `.env` file you can copy the YAML template:
+```bash
+cp .clinware.yml.example .clinware.yml
+```
+Then edit `.clinware.yml` and set `google_api_key`. Both approaches work; environment variables take priority over the YAML file.
 
 ### 4. Build the fat JAR
 ```bash
@@ -446,6 +454,103 @@ Also check your internet connection — the MCP server fetches live news remotel
 **SLF4J / logging noise**
 - MCP server stderr is drained to the SLF4J logger at DEBUG level — expected and harmless
 - To suppress: set `org.slf4j.simpleLogger.defaultLogLevel=warn` in your JVM args
+
+---
+
+## Implementation
+
+### Overview
+
+ A Java agent that fetches live news via an MCP server and synthesises it into grounded, coherent answers using Gen AI. The implementation is split into four clearly separated layers that communicate through well-defined interfaces.
+
+---
+
+### Layer 1 — Configuration (`AgentConfig`)
+
+`AgentConfig` reads settings from three sources in priority order: **environment variables** > **YAML file** (`.clinware.yml`) > **built-in defaults**. The YAML file is parsed using SnakeYAML's `SafeConstructor`, which prevents YAML-deserialization attacks. Numeric fields fall back to defaults when the raw string is not a valid number rather than crashing.
+
+---
+
+### Layer 2 — MCP Client (`McpStdioClient`, `McpRequest`, `McpResponse`)
+
+The agent spawns the Verge News MCP server (`node verge-news-mcp/build/index.js`) as a child process and communicates with it using **JSON-RPC 2.0 over stdio** — exactly as the MCP specification mandates.
+
+**Startup handshake (3 steps):**
+1. Send `initialize` request with protocol version and client info.
+2. Receive the server's capability response.
+3. Send `notifications/initialized` (one-way, no response expected).
+
+Each request carries a increasing integer ID (`AtomicInteger`). Responses are read on a pooled background thread (`ExecutorService`) and retrieved with `Future.get(timeoutMs, ...)`. If the server does not respond within `MCP_TIMEOUT_MS`, the future is cancelled and a `TimeoutException` propagates to the caller.
+
+---
+
+### Layer 3 — Tool Execution (`NewsToolExecutor`)
+
+`NewsToolExecutor` bridges the Gen AI function-call response to the MCP transport layer:
+
+1. Extracts `keyword` and `days` from Gemini's `FunctionCall` args (with safe defaults).
+2. Calls `McpStdioClient.callTool("search-news", ...)`.
+3. Parses the raw `JsonElement` response, which may arrive in three shapes:
+   - **Shape A** — `{"content":[{"type":"text","text":"..."}]}` (standard MCP)
+   - **Shape B** — `{"articles":[{...}]}` (article-object array)
+   - **Shape C** — raw string or primitive
+4. If no results are returned, automatically retries with progressively broader **fallback keywords** before giving up:
+   - Clinware queries: `"Clinware AI"` → `"post-acute care AI admissions"` → `"hospital SNF transition technology"`
+   - Healthcare queries: `"AI healthcare technology"` → `"medical technology innovation"` → `"digital health market trends"`
+
+---
+
+### Layer 4 — Agent Loop (`ClinwareAgent`)
+
+The agent drives an **agentic tool-calling loop** built on top of the Google GenAI Java SDK:
+
+```
+append user turn to history
+loop (max 3 iterations):
+    call Gemini with full history + tool definition
+    if response contains function_call:
+        call NewsToolExecutor.execute()
+        inject Part.fromFunctionResponse() into history
+        continue loop
+    else:
+        break → final answer obtained
+append model's answer to history
+```
+
+**Key design decisions:**
+
+| Decision | Rationale |
+|---|---|
+| Multi-turn `history` list | Enables follow-up questions; all turns (user, model, tool-result) are accumulated in a single `List<Content>` and sent with every Gemini call. |
+| `rollbackToIndex()` on error | If any step fails, all turns added for the current query are removed, keeping history clean for the next question. |
+| One-retry on Gemini failure | Transient HTTP errors (rate-limit `429`, network blip) are retried after a delay parsed from the response body; otherwise 1.5 s. |
+| `AgentMode` enum | Allows switching between MCP-only, Google-Search-grounding-only, and hybrid at runtime without restarting. In hybrid mode, if MCP returns nothing the agent transparently falls back to Google Search. |
+| `FunctionDeclaration` on the SDK | The tool is declared using `FunctionDeclaration.builder()` with a typed `Schema` (OBJECT with `keyword: STRING` and `days: INTEGER`). This is what causes Gemini to emit a structured `FunctionCall` part rather than hallucinating tool invocations in plain text. |
+
+---
+
+### Prompt Engineering (`PromptLibrary`)
+
+The system instruction is structured into four named sections:
+
+1. **YOUR IDENTITY** — strict rules preventing the agent from ever claiming to be Gemini or a Google product.
+2. **CLINWARE COMPANY INTELLIGENCE** — directs the model to **always** call `searchNews("Clinware")` first, then surface funding, product launches, partnerships, and market moves.
+3. **DISEASES, CURES, AND HEALTHCARE RESEARCH** — extends the agent to the broader healthcare market; uses `searchNews` for recent events, internal knowledge for established medicine.
+4. **SCOPE RESTRICTION** — hard block: the agent refuses all off-topic questions (politics, sports, entertainment, etc.) with an exact canned response. `MUST` language and explicit prohibition of exceptions make this non-negotiable even under adversarial prompting.
+
+---
+
+### Session Persistence (`SessionStore`)
+
+Every text-bearing conversation turn is serialised to `~/.clinware/history.json` as a JSON array of `{role, text}` objects using Gson. Tool-call turns and tool-response turns are intentionally excluded (they are transient and regenerated on the next run). A JVM shutdown hook ensures the file is flushed on clean exit (`exit`, `quit`, `Ctrl-C`). "New Chat" archives the current session to a timestamped file under `~/.clinware/sessions/`.
+
+---
+
+### UI (`Terminal`, `QueryConsole`, `AgentWindow`)
+
+- **`Terminal`** — ANSI-aware print helpers; detected automatically on macOS/Linux; gracefully degraded on Windows (no escape codes).
+- **`QueryConsole`** — raw-terminal mode (via `stty raw -echo`) for arrow-key history navigation and `Ctrl-U` line-clear; falls back to `BufferedReader` on non-TTY environments (CI, pipes).
+- **`AgentWindow`** — full Swing GUI (`JFrame`) with a `JTextPane` chat pane, a `JSplitPane` sidebar, `JTabbedPane` (Turns / Sessions), a mode selector `JComboBox`, and a typewriter-effect render for agent responses. All agent calls run on a dedicated daemon `ExecutorService` to keep the EDT free.
 
 ---
 
