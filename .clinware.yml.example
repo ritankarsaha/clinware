@@ -1,0 +1,14 @@
+# ── Clinware Intelligence Agent — configuration file
+
+
+# [REQUIRED] Google AI Studio API key
+google_api_key: "AIzaSy..."
+
+# Gemini model to use for inference            (env: GEMINI_MODEL, default: gemini-2.5-flash)
+gemini_model: "gemini-2.5-flash"
+
+# MCP tool call timeout in milliseconds        (env: MCP_TIMEOUT_MS, default: 15000)
+mcp_timeout_ms: 15000
+
+# How many days back to search for news        (env: NEWS_SEARCH_DAYS, default: 30)
+news_search_days: 30
