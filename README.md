@@ -564,3 +564,7 @@ Every text-bearing conversation turn is serialised to `~/.clinware/history.json`
 - **Build:** Maven 3 + Shade plugin (fat JAR)
 - **Config:** Environment variables + SnakeYAML
 - **Persistence:** Gson — JSON files in `~/.clinware/`
+
+
+## Demo
+(https://www.loom.com/share/9e343ad3e8dd4c8d999011c566622070)[Video Demo Link]
